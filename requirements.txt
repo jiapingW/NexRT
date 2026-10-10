@@ -1,0 +1,9 @@
+# Decode engine dependencies; see README.md for CUDA and hardware requirements.
+torch>=2.6
+safetensors>=0.4
+
+# SGLang prefill environment also requires:
+# sglang (tested version and required capabilities: see README.md)
+# transformers>=4.45
+# tokenizers>=0.20
+# numpy>=1.24
