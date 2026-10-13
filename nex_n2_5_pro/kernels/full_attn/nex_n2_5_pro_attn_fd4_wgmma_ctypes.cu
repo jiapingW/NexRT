@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// True-four-head TMA + WGMMA attention partial and combine for H100.
+// True-four-head TMA + WGMMA attention partial and combine for Hopper.
 // WGMMA BF16 starts at N=8. The Q tensor map describes four real rows but
 // loads an eight-row box; TMA's specified OOB behavior zero-fills heads 4..7.
 #ifndef NEXRT_NEX_N2_5_PRO_KERNEL_FAMILY
@@ -412,6 +412,26 @@ static CUtensorMap encode_map(void* ptr, int outer, int inner, int box_outer, in
     return map;
 }
 
+// Smaller Hopper devices cannot keep all 128 partial CTAs resident for the
+// cooperative barrier. Keep the same splits and reduction order, but use the
+// stream dependency between two launches as the partial->combine barrier.
+template <int STAGES>
+__global__ __launch_bounds__(128) void wgmma_fd4_partial(const __grid_constant__ CUtensorMap Kmap,
+                                                         const __grid_constant__ CUtensorMap Vmap,
+                                                         const __grid_constant__ CUtensorMap Qmap,
+                                                         float* ws_m, float* ws_l, bf16* ws_acc,
+                                                         int S, const uint32_t* seqlen, int ns,
+                                                         float scaling) {
+    if (seqlen) S = static_cast<int>(seqlen[1]) + 1;
+    wgmma_fd4_partial_body<STAGES>(Kmap, Vmap, Qmap, ws_m, ws_l, ws_acc, S, ns, scaling);
+}
+
+__global__ __launch_bounds__(256) void wgmma_fd4_combine(const float* ws_m, const float* ws_l,
+                                                         const bf16* ws_acc, bf16* out, int ns,
+                                                         float scaling) {
+    wgmma_fd4_combine_body<8, 256>(ws_m, ws_l, ws_acc, out, ns, scaling);
+}
+
 // Cooperative partial->combine stage switch.  The caller owns the reset-free
 // counter so separately executable blocks/requests never alias barrier state.
 static int launch_wgmma_fd4_mega(const void* Q, const void* K, const void* V, int S,
@@ -426,19 +446,28 @@ static int launch_wgmma_fd4_mega(const void* Q, const void* K, const void* V, in
     static bool initialized = false;
     static int cooperative_capacity = 0;
     if (!initialized) {
-        cudaFuncSetAttribute(wgmma_fd4_mega<STAGES>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             smem);
-        int active_per_sm = 0, sm_count = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_per_sm, wgmma_fd4_mega<STAGES>, 256,
-                                                      smem);
-        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+        cudaError_t error = cudaFuncSetAttribute(wgmma_fd4_mega<STAGES>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (error != cudaSuccess) return static_cast<int>(error);
+        int active_per_sm = 0, sm_count = 0, device = 0;
+        error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_per_sm,
+                                                              wgmma_fd4_mega<STAGES>, 256, smem);
+        if (error != cudaSuccess) return static_cast<int>(error);
+        error = cudaGetDevice(&device);
+        if (error != cudaSuccess) return static_cast<int>(error);
+        error = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+        if (error != cudaSuccess) return static_cast<int>(error);
         cooperative_capacity = active_per_sm * sm_count;
+        if (ns > cooperative_capacity) {
+            error = cudaFuncSetAttribute(wgmma_fd4_partial<STAGES>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            if (error != cudaSuccess) return static_cast<int>(error);
+        }
         initialized = true;
     }
     cudaStream_t st = reinterpret_cast<cudaStream_t>(stream);
     if (!ctx) return static_cast<int>(cudaErrorInvalidDevicePointer);
     if (ns != NH * HD / 8) return static_cast<int>(cudaErrorInvalidConfiguration);
-    if (ns > cooperative_capacity) return static_cast<int>(cudaErrorInvalidConfiguration);
     float* wm_p = static_cast<float*>(wm);
     float* wl_p = static_cast<float*>(wl);
     bf16* wa_p = static_cast<bf16*>(wa);
@@ -446,6 +475,15 @@ static int launch_wgmma_fd4_mega(const void* Q, const void* K, const void* V, in
     const uint32_t* seqlen_p = static_cast<const uint32_t*>(seqlen);
     uint32_t* counter_p = static_cast<uint32_t*>(barrier_counter);
     if (!counter_p) return static_cast<int>(cudaErrorInvalidDevicePointer);
+    if (ns > cooperative_capacity) {
+        wgmma_fd4_partial<STAGES>
+            <<<ns, 128, smem, st>>>(Kmap, Vmap, Qmap, wm_p, wl_p, wa_p, S, seqlen_p, ns, scaling);
+        const cudaError_t partial_error = cudaGetLastError();
+        if (partial_error != cudaSuccess) return static_cast<int>(partial_error);
+        wgmma_fd4_combine<<<NH * HD / 8, 256, ns * 8 * sizeof(bf16), st>>>(wm_p, wl_p, wa_p, out_p,
+                                                                           ns, scaling);
+        return static_cast<int>(cudaGetLastError());
+    }
     void* args[] = {
         &Kmap, &Vmap, &Qmap, &wm_p, &wl_p, &wa_p, &out_p, &S, &seqlen_p, &ns, &scaling, &counter_p,
     };

@@ -15,7 +15,7 @@
 
 """The production WGMMA attention megakernel must match between fixed-S and device-S launches.
 
-Run on one H100:
+Run on one Hopper GPU (including H20's non-cooperative fallback):
   python3 nex_n2_5_pro/tests/test_attn_core_dyn.py
 """
 
@@ -32,7 +32,7 @@ from kernel_build import build_kernel  # noqa: E402
 
 KDIR = HERE / "kernels" / "full_attn"
 HD, NH, NS = 256, 4, 128
-KV_CAPACITY = 128 * 1024 + 1024
+KV_CAPACITY = 256 * 1024 + 1024
 
 
 def build():
@@ -108,7 +108,7 @@ def main():
         if rc:
             raise RuntimeError(f"device-S WGMMA launch returned CUDA error {rc}")
 
-    for s in (512, 1024, 2049, 4096, 16384):
+    for s in (1, 27, 127, 128, 129, 512, 1024, 2049, 4096, 16384):
         slot[1] = s - 1
         launch_fixed(s, fixed)
         launch_dynamic(dynamic)
@@ -117,6 +117,16 @@ def main():
         ok = max_abs == 0.0
         failures += int(not ok)
         print(f"S={s:6d} fixed-vs-device max_abs={max_abs:.3e} {'OK' if ok else 'MISMATCH'}")
+        # A separate FP32 reference catches errors shared by both launch paths,
+        # including empty partials when a short prompt has fewer than 128 tokens.
+        scores = q.float() @ k[:s].float().T / (HD**0.5)
+        reference = scores.softmax(-1) @ v[:s].float()
+        reference_error = float((dynamic[3].float() - reference).abs().max())
+        reference_ok = reference_error < 2e-3
+        failures += int(not reference_ok)
+        print(
+            f"S={s:6d} vs-fp32 max_abs={reference_error:.3e} {'OK' if reference_ok else 'MISMATCH'}"
+        )
 
     slot[1] = 511
     launch_dynamic(dynamic)
@@ -125,7 +135,7 @@ def main():
     with torch.cuda.graph(graph):
         launch_dynamic(dynamic)
     torch.cuda.synchronize()
-    for s in (512, 2049, 4096):
+    for s in (1, 27, 129, 512, 2049, 4096):
         slot[1] = s - 1
         graph.replay()
         launch_fixed(s, fixed)
