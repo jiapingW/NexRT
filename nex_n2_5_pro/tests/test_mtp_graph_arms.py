@@ -101,7 +101,6 @@ BS1_SENTINELS = {
 DRAFT_CLONES = {
     r"\bMtpQkvGroupSplitKKernel": (2, 2),
     r"\bMtpNormRopeFusedKernel": (2, 2),
-    r"\bmtp_wgmma_fd4_mega": (2, 2),
     r"\bMtpOProjFusedPushKernel": (4, 4),
     r"\bMtpGateGemvRowRawAndRmsCta0Kernel": (2, 2),
     r"\bMtpGateTopKSingleCtaNoLogitRmsScaleXnKernel": (2, 2),
@@ -110,6 +109,10 @@ DRAFT_CLONES = {
     r"\bMtpLmHeadGemvRowRmsCta0Kernel": (3, 3),
     r"\bMtpFcT4Kernel": (1, 1),
 }
+
+# Each of the two draft attention calls uses either the cooperative kernel
+# or the complete partial/combine fallback. Both calls select the same path.
+DRAFT_ATTENTION = ("mtp_wgmma_fd4_mega", "wgmma_fd4_partial", "wgmma_fd4_combine")
 
 EXPECT = {
     "noncp": {
@@ -260,6 +263,22 @@ def check_symbols(arm, agg, *, round_graph=True):
             bad.append(f"{arm}: draft clone {pat} x{c:.1f} not in [{lo},{hi}]")
         if not round_graph and c > 0:
             bad.append(f"{arm}: draft clone in verify-only graph: {pat} x{c:.1f}")
+
+    attention_counts = []
+    for name in DRAFT_ATTENTION:
+        # Fallback names are shared with bs1; only the M4 namespace is valid.
+        total = count_of(rf"\b{name}\b")
+        mtp_count = count_of(rf"\bM4::{name}\b")
+        attention_counts.append(mtp_count)
+        if total != mtp_count:
+            bad.append(f"{arm}: draft attention outside MTP family: {name} x{total - mtp_count:g}")
+        if not round_graph and total > 0:
+            bad.append(f"{arm}: draft clone in verify-only graph: {name} x{total:g}")
+    if round_graph and tuple(attention_counts) not in ((2, 0, 0), (0, 2, 2)):
+        bad.append(
+            f"{arm}: draft attention counts (mega, partial, combine) "
+            f"{tuple(attention_counts)} must be (2, 0, 0) or (0, 2, 2)"
+        )
     return bad
 
 
